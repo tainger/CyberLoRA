@@ -1,0 +1,34 @@
+# 虚拟环境
+.venv-demo/
+.venv-infer/
+venv-infer/
+
+# 运行产物
+demo_out/
+models/
+raw_photos/
+selected/
+select_report.md
+dataset_report.md
+sim_report.md
+
+# 模型 / 训练产物
+*.safetensors
+*.bin
+*.ckpt
+*.pt
+*.onnx
+models/**
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 系统
+.DS_Store
+
+# Colab 训练上传物
+train_data/
+outputs/
+log/
