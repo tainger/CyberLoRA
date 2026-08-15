@@ -161,6 +161,12 @@ def build_prompt(
         "shot": shot,
         "weight": w,
         "weight_reason": w_reason,
+        # 原样透传 SCENES 字段（单一数据源）：InstantID 路线要去掉触发词，
+        # 需要自行拼 subject/scene/style/quality
+        "subject": s["subject"],
+        "scene": s["scene"],
+        "style": s["style"],
+        "quality": s["quality"],
         "positive": positive,
         "negative": s["negative"],
     }

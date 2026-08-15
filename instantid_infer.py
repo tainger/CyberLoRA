@@ -29,6 +29,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+from PIL import Image
 
 from prompt_gen import INFER_PARAMS, build_prompt
 
@@ -115,6 +116,30 @@ def draw_kps(kps, size=GEN_SIZE):
 # 管线
 # ---------------------------------------------------------------------------
 
+def _patch_layernorm_to_fp32(module) -> int:
+    """CPU fp16 没有 LayerNorm kernel（RuntimeError: LayerNormKernelImpl not
+    implemented for 'Half'）。把 LayerNorm 换成 fp32 上浮包装：输入 fp16 → fp32 计算 → 回退 fp16。
+    其余算子（Conv/Linear/GroupNorm/SDPA）经实测均支持 CPU fp16，不需要处理。"""
+    import torch.nn as nn
+
+    class FP32LayerNorm(nn.Module):
+        def __init__(self, ln: nn.LayerNorm):
+            super().__init__()
+            self.ln = ln.float()
+
+        def forward(self, x):
+            return self.ln(x.float()).to(x.dtype)
+
+    count = 0
+    for name, child in list(module.named_children()):
+        if isinstance(child, nn.LayerNorm):
+            setattr(module, name, FP32LayerNorm(child))
+            count += 1
+        else:
+            count += _patch_layernorm_to_fp32(child)
+    return count
+
+
 def load_instantid_pipeline(model_id: str, cn_dir: str, adapter_path: str, ip_scale: float, device, dtype):
     """vendored InstantID 管线（Apache-2.0）+ IP-Adapter。"""
     from diffusers import ControlNetModel
@@ -132,7 +157,16 @@ def load_instantid_pipeline(model_id: str, cn_dir: str, adapter_path: str, ip_sc
         )
     pipe.load_ip_adapter_instantid(adapter_path)
     pipe.set_ip_adapter_scale(ip_scale)
-    return pipe.to(device)
+    pipe = pipe.to(device)
+    if device == "cpu":
+        n = 0
+        targets = [pipe.unet, pipe.controlnet, pipe.text_encoder, pipe.text_encoder_2]
+        if hasattr(pipe, "image_proj_model"):
+            targets.append(pipe.image_proj_model)  # IP-Adapter Resampler（挂在管线上而非 unet 内）
+        for sub in targets:
+            n += _patch_layernorm_to_fp32(sub)
+        print(f"CPU 模式：已把 {n} 个 LayerNorm 换成 fp32 上浮包装")
+    return pipe
 
 
 def main(argv=None) -> int:
@@ -141,10 +175,12 @@ def main(argv=None) -> int:
     ap.add_argument("--scene", "-s", default=DEFAULT_SCENE, help="场景 key（默认 business）")
     ap.add_argument("--model", "-m", default=None, help="SDXL 底模 ID 或本地路径（默认自动找本地）")
     ap.add_argument("--steps", type=int, default=28, help="采样步数（默认 28）")
+    ap.add_argument("--size", type=int, default=GEN_SIZE, help=f"输出尺寸（默认 {GEN_SIZE}；16GB 内存机器建议 512）")
     ap.add_argument("--seed", type=int, default=42, help="随机种子")
     ap.add_argument("--ip-scale", type=float, default=0.8, help="IP-Adapter 强度")
     ap.add_argument("--cn-scale", type=float, default=0.8, help="ControlNet 强度")
     ap.add_argument("--output", "-o", default="demo_out/instantid", help="输出目录")
+    ap.add_argument("--device", default="auto", help="auto|cpu|mps|cuda（默认 auto）")
     ap.add_argument("--score", action="store_true", help="生成后计算与参考照的相似度")
     args = ap.parse_args(argv)
 
@@ -160,13 +196,26 @@ def main(argv=None) -> int:
     import torch
 
     # ---- 设备 ----
-    if torch.backends.mps.is_available():
-        device, dtype = "mps", torch.float16
-    elif torch.cuda.is_available():
-        device, dtype = "cuda", torch.float16
-    else:
-        device, dtype = "cpu", torch.float32
+    # auto：Apple Silicon 优先 MPS；Intel Mac 的 MPS 不可用（torch 2.x 已停止支持）且显存
+    # 仅 4GB 装不下 SDXL，必须走 CPU。CUDA 同理优先。
+    import platform
 
+    dev = args.device
+    if dev == "auto":
+        if torch.cuda.is_available():
+            dev = "cuda"
+        elif torch.backends.mps.is_available() and platform.machine() == "arm64":
+            dev = "mps"
+        else:
+            dev = "cpu"
+    if dev in ("mps", "cuda"):
+        device, dtype = dev, torch.float16
+    else:
+        # CPU：强制 fp16 —— 整管 fp32 需要 >20GB 内存（unet fp32 ~10G + ControlNet fp32 ~5G），
+        # 16GB 机器必然 OOM。fp16 计算会由 CPU 自动上浮，速度略慢但能跑。
+        device, dtype = "cpu", torch.float16
+
+    print(f"设备：{device}（dtype={dtype}）")
     # ---- 本地资源定位 ----
     model_id = args.model or find_local_sdxl() or DEFAULT_MODEL
     adapter_path, cn_dir = find_instantid()
@@ -194,6 +243,9 @@ def main(argv=None) -> int:
     # 关键点按 1024 → GEN_SIZE 比例缩放
     kps_scaled = kps * (GEN_SIZE / 1024.0)
     face_kps = draw_kps(kps_scaled, size=GEN_SIZE)
+    # diffusers 0.32+ 对裸 numpy 按 len() 当 batch 数（640×640×3 → 640）会报错；
+    # 官方 InstantID 实现传 PIL Image，这里保持一致
+    face_kps = Image.fromarray(face_kps)
     print("参考照人脸提取完成")
 
     # ---- 管线 ----
@@ -205,19 +257,55 @@ def main(argv=None) -> int:
         [scene["subject"], scene["scene"], scene["style"], scene["quality"]]
     )
 
+    prompt_kwargs = {}
+    if device == "cpu":
+        # 16GB 内存装不下全管 fp16（~12GB）+ 激活：先编码 prompt，再释放两个文本编码器
+        # （省 ~3.4GB），避免系统换页导致出图慢 10 倍以上。编码器只在开头用一次。
+        print("CPU 模式：预编码 prompt 并释放文本编码器 ...")
+        prompt_embeds, negative_prompt_embeds, pooled_prompt_embeds, negative_pooled_prompt_embeds = pipe.encode_prompt(
+            positive,
+            None,
+            device=device,
+            num_images_per_prompt=1,
+            do_classifier_free_guidance=True,
+            negative_prompt=scene["negative"],
+        )
+        # 注意：不能用 del —— diffusers 管线 __getattr__ 会回退到 config（model_index.json
+        # 的元组条目），导致 'tuple' object has no attribute 'dtype'。显式置 None 才真正释放。
+        pipe.text_encoder = None
+        pipe.text_encoder_2 = None
+        import gc
+
+        gc.collect()
+        prompt_kwargs.update(
+            prompt=None,
+            negative_prompt=None,
+            prompt_embeds=prompt_embeds,
+            negative_prompt_embeds=negative_prompt_embeds,
+            pooled_prompt_embeds=pooled_prompt_embeds,
+            negative_pooled_prompt_embeds=negative_pooled_prompt_embeds,
+        )
+    else:
+        prompt_kwargs.update(prompt=positive, negative_prompt=scene["negative"])
+
     print(f"出图：{scene['name']}（steps={args.steps}, seed={args.seed}）...")
+    # CPU 出图耗时，打印每步进度（日志/终端都可见）
+    def _cb(step, _t, _kwargs):
+        print(f"  step {step}/{args.steps}", flush=True)
+
     image = pipe(
         image=face_kps,
-        prompt=positive,
-        negative_prompt=scene["negative"],
         image_embeds=face_emb,
         controlnet_conditioning_scale=args.cn_scale,
         ip_adapter_scale=args.ip_scale,
         num_inference_steps=args.steps,
         guidance_scale=INFER_PARAMS["cfg_scale"],
         generator=torch.Generator("cpu").manual_seed(args.seed),
-        width=GEN_SIZE,
-        height=GEN_SIZE,
+        width=args.size,
+        height=args.size,
+        callback=_cb,
+        callback_steps=1,
+        **prompt_kwargs,
     ).images[0]
 
     out_dir = Path(args.output)
