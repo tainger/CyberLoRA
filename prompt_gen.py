@@ -91,6 +91,15 @@ SCENES: dict = {
         "quality": "hdr, 8k, unreal engine 5 render",
         "negative": "worst quality, low quality, blurry, deformed face, bad anatomy, extra limbs",
     },
+    "sabo": {
+        "name": "动漫萨博",
+        "shot": "medium",
+        "subject": "1boy",
+        "scene": "cosplay, black top hat with goggles, blonde hair, long blue coat over white shirt, blue flames, confident smile",
+        "style": "One Piece anime style, vibrant colors, clean lineart",
+        "quality": "masterpiece, 8k",
+        "negative": "worst quality, low quality, blurry, deformed face, bad anatomy",
+    },
 }
 
 # ---------------------------------------------------------------------------
